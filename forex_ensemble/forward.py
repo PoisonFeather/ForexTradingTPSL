@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 import statistics
 
-from ..ensemble_v2.ensemble_v2 import combine_signals
+from forex_ensemble.ensemble_v2 import combine_signals
 
 # -------- util: suportă atât dict cât și obiect cu atribute --------
 def _get(o, name, default=None):

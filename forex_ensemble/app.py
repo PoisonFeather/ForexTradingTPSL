@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 try:
-    from .forwardtest import WalkForwardTester
+    from .forward import WalkForwardTester
 except Exception:
     WalkForwardTester = None  # will check at runtime and warn if missing
 
