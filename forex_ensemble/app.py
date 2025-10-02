@@ -16,8 +16,14 @@ from .backtest.report import save_report
 from datetime import datetime, timezone
 import pandas as pd
 
+try:
+    from .forwardtest import WalkForwardTester
+except Exception:
+    WalkForwardTester = None  # will check at runtime and warn if missing
 
 cli = typer.Typer(help="Ensemble day-trading advisor (educational).")
+
+# ============== BACKTEST (existing) ==============
 
 @cli.command(name="backtest-cmd")
 def backtest_cmd(
@@ -99,6 +105,8 @@ async def _backtest(symbol, timeframe, provider, start, end, spread, slippage_pi
     print(f"[green]Fișiere scrise în ./{out_dir}[/]")
 
 
+# ============== ADVISE (existing) ==============
+
 @cli.command()
 def advise(
     symbol: str = typer.Option(settings.default_symbol, help="Ex: EURUSD"),
@@ -173,6 +181,125 @@ async def _advise(symbol: str, timeframe: Timeframe, limit: int, provider: str, 
 
     finally:
         await mdp.close()
+
+
+# ============== WALK-FORWARD (NEW) ==============
+
+def _provider_from_name(name: str):
+    if name == "alpha_vantage":
+        from .data.alpha_vantage import AlphaVantageProvider
+        return AlphaVantageProvider()
+    elif name == "twelve_data":
+        from .data.twelve_data import TwelveDataProvider
+        return TwelveDataProvider()
+    else:
+        return MockProvider()
+
+def _signals_from_strategies(candles_slice) -> list[dict]:
+    """
+    Adaptează StrategySignal -> dict pentru forward tester.
+    Se apelează 'la zi' pe candles[:t+1].
+    """
+    out: list[dict] = []
+    for strat in default_strategies():
+        sg: StrategySignal = strat.generate(candles_slice)
+        out.append({
+            "strategy": sg.name,
+            "dir": sg.direction,  # 'long'|'short'|'neutral'
+            "entry": sg.entry,
+            "sl": sg.stop_loss,
+            "tp": sg.take_profit,
+            "conf": float(sg.confidence or 0.0),
+        })
+    return out
+
+@cli.command(name="walkforward", help="Run walk-forward forward testing (train→test→shift).")
+def walkforward_cmd(
+    symbol: str = typer.Option(settings.default_symbol, help="Ex: EURUSD"),
+    timeframe: Timeframe = typer.Option(settings.default_timeframe, help="Ex: 15min"),
+    provider: str = typer.Option("twelve_data", help="mock | alpha_vantage | twelve_data"),
+    # date range OR limit (if dates omitted)
+    start: str = typer.Option("", help="Start ISO date (optional), ex: 2025-06-01"),
+    end: str = typer.Option("", help="End ISO date (optional), ex: 2025-10-01"),
+    limit: int = typer.Option(8000, help="Limit candles if start/end not provided"),
+    # walk-forward params
+    train: int = typer.Option(2500, help="Train bars"),
+    test: int = typer.Option(500, help="Test bars per split"),
+    step: int = typer.Option(250, help="Shift (bars)"),
+    mode: str = typer.Option("expanding", help="expanding | rolling"),
+    # costs & logic
+    spread: float = typer.Option(0.00002, help="Spread (price units)"),
+    slippage: float = typer.Option(0.00001, help="Slippage (price units)"),
+    fees: float = typer.Option(0.0, help="Per-trade fee in price units"),
+    max_hold: int = typer.Option(200, help="Max bars to hold a trade"),
+    oppose_damp: float = typer.Option(0.35, help="Damping for opposing strategy proposals"),
+    out: str = typer.Option("", help="Optional CSV path for trades"),
+):
+    if WalkForwardTester is None:
+        print("[red]WalkForwardTester indisponibil. Adaugă mai întâi forex_ensemble/forward.py și ensemble_v2.py.[/]")
+        raise typer.Exit(code=1)
+    asyncio.run(_walkforward(symbol, timeframe, provider, start, end, limit,
+                             train, test, step, mode, spread, slippage, fees,
+                             max_hold, oppose_damp, out))
+
+async def _walkforward(symbol: str, timeframe: Timeframe, provider: str,
+                       start: str, end: str, limit: int,
+                       train: int, test: int, step: int, mode: str,
+                       spread: float, slippage: float, fees: float,
+                       max_hold: int, oppose_damp: float, out: str):
+    mdp = _provider_from_name(provider)
+    try:
+        if start and end:
+            all_candles = await mdp.get_recent_candles(symbol, timeframe, limit=20000)
+            start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+            end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+            candles = [cd for cd in all_candles if start_dt <= cd.time <= end_dt]
+        else:
+            candles = await mdp.get_recent_candles(symbol, timeframe, limit=limit)
+
+        if len(candles) < train + test + 10:
+            print("[red]Prea puține lumânări pentru parametrii aleși. Mărește limit sau micșorează train/test.[/]")
+            return
+
+        tester = WalkForwardTester(
+            provider_fn=None,
+            strategies_fn=_signals_from_strategies,
+            symbol=symbol,
+            timeframe=timeframe,
+            fees=fees,
+            spread=spread,
+            slippage=slippage,
+            max_hold=max_hold,
+        )
+        wf = tester.walkforward(
+            candles=candles,
+            train=train,
+            test=test,
+            step=step,
+            mode=mode,
+            optimize_by="sharpe",
+            oppose_damp=oppose_damp,
+        )
+
+        print(f"\n[bold cyan]Walk-Forward Summary[/]  Symbol={symbol}  TF={timeframe}  Splits={len(wf.splits)}")
+        print(f"Trades={wf.metrics['trades']}  WinRate={wf.metrics['win_rate']:.2%}  "
+              f"AvgPips={wf.metrics['avg_pips']:.2f}  Sharpe={wf.metrics['sharpe']:.2f}  "
+              f"GrossPips={wf.metrics['gross_pips']:.1f}  MaxDD(Pips)={wf.metrics['max_dd_pips']:.1f}")
+
+        if out:
+            import csv
+            with open(out, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["open_idx","close_idx","side","entry","exit","pips(price_units)","hit","conf"])
+                for t in wf.trades:
+                    w.writerow([t.open_idx, t.close_idx, t.side,
+                                f"{t.entry:.6f}", f"{t.exit_price:.6f}",
+                                t.result, t.hit, t.meta.get("conf", 0.0)])
+            print(f"[green]Saved trades to {out}[/]")
+
+    finally:
+        await mdp.close()
+
 
 if __name__ == "__main__":
     cli()
