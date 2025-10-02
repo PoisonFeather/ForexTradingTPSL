@@ -1,0 +1,16 @@
+[project]
+name = "forex-ensemble"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.8",
+  "httpx>=0.27",
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "python-dotenv>=1.0",
+  "typer>=0.12",     # CLI drăguț
+  "rich>=13.7"       # output frumos
+]
+
+[tool.ruff]
+line-length = 100
