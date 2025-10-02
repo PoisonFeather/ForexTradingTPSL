@@ -11,8 +11,93 @@ from .types import Timeframe, StrategySignal
 from .data.mock_provider import MockProvider
 from .strategies import default_strategies
 from .ensemble.aggregator import aggregate_signals, AggregationConfig
+from .backtest.engine import backtest, BTConfig
+from .backtest.report import save_report
+from datetime import datetime, timezone
+import pandas as pd
+
 
 cli = typer.Typer(help="Ensemble day-trading advisor (educational).")
+
+@cli.command(name="backtest-cmd")
+def backtest_cmd(
+    symbol: str = typer.Option(settings.default_symbol, help="Ex: EURUSD"),
+    timeframe: Timeframe = typer.Option(settings.default_timeframe, help="Ex: 5min"),
+    provider: str = typer.Option("twelve_data", help="mock | alpha_vantage | twelve_data"),
+    start: str = typer.Option(..., help="Start ISO date, ex: 2025-08-01"),
+    end: str = typer.Option(..., help="End ISO date, ex: 2025-10-01"),
+    spread: float = typer.Option(0.00010, help="Spread aprox (majors)"),
+    slippage_pips: float = typer.Option(0.8, help="Slippage în pips"),
+    risk_pct: float = typer.Option(1.0, help="Risc per tranzacție (%)"),
+    rr_required: float = typer.Option(1.8, help="R:R minim al semnalului"),
+    entry_buffer_atr: float = typer.Option(0.10, help="Buffer ATR pentru entry"),
+    active_start_hour: int = typer.Option(7, help="Oră start (local time)"),
+    active_end_hour: int = typer.Option(20, help="Oră end (local time)"),
+    cooldown_bars: int = typer.Option(6, help="Bare de pauză după un trade"),
+    max_trades_per_day: int = typer.Option(10, help="Limită tranzacții/zi"),
+    trend_slope_threshold: float = typer.Option(0.6, help="Prag panta EMA50/ATR (trend)"),
+    out_dir: str = typer.Option("bt_out", help="Folder rezultate"),
+):
+    """
+    Backtest cu filtre de regim, orar, cooldown și cap/zi. Scrie trades.csv, equity.csv, summary.txt
+    """
+    asyncio.run(_backtest(symbol, timeframe, provider, start, end, spread, slippage_pips,
+                          risk_pct, rr_required, entry_buffer_atr,
+                          active_start_hour, active_end_hour,
+                          cooldown_bars, max_trades_per_day, trend_slope_threshold, out_dir))
+
+async def _backtest(symbol, timeframe, provider, start, end, spread, slippage_pips,
+                    risk_pct, rr_required, entry_buffer_atr,
+                    active_start_hour, active_end_hour,
+                    cooldown_bars, max_trades_per_day, trend_slope_threshold, out_dir):
+    # provider
+    if provider == "alpha_vantage":
+        from .data.alpha_vantage import AlphaVantageProvider
+        mdp = AlphaVantageProvider()
+    elif provider == "twelve_data":
+        from .data.twelve_data import TwelveDataProvider
+        mdp = TwelveDataProvider()
+    else:
+        mdp = MockProvider()
+
+    try:
+        all_candles = await mdp.get_recent_candles(symbol, timeframe, limit=5000)
+    except Exception as e:
+        print(f"[yellow]Provider error: {e}. Comut pe mock.[/]")
+        mdp = MockProvider()
+        all_candles = await mdp.get_recent_candles(symbol, timeframe, limit=5000)
+    finally:
+        await mdp.close()
+
+    start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+    end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+    candles = [cd for cd in all_candles if start_dt <= cd.time <= end_dt]
+    if len(candles) < 200:
+        print("[red]Prea puține lumânări după filtrare; extinde intervalul sau crește limit.[/]")
+        return
+
+    print(f"[bold cyan]Backtesting {symbol} / {timeframe} între {start} și {end} cu {len(candles)} bare...[/]")
+
+    cfg = BTConfig(
+        entry_buffer_atr=entry_buffer_atr,
+        rr_required=rr_required,
+        spread=spread,
+        slippage_pips=slippage_pips,
+        min_confidence=0.05,
+        active_start_hour=active_start_hour,
+        active_end_hour=active_end_hour,
+        cooldown_bars=cooldown_bars,
+        max_trades_per_day=max_trades_per_day,
+        trend_slope_threshold=trend_slope_threshold,
+    )
+    run = backtest(candles, cfg=cfg, initial_equity=10_000.0, risk_pct_per_trade=risk_pct)
+    summary = save_report(run, out_dir, risk_pct)
+    print("[bold magenta]Summary[/]")
+    for k, v in summary.items():
+        print(f"{k}: {v}")
+    print(f"start_equity: {run.start_equity:.2f}  end_equity: {run.end_equity:.2f}")
+    print(f"[green]Fișiere scrise în ./{out_dir}[/]")
+
 
 @cli.command()
 def advise(
